@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
+# Copyright (c) 2013 Takahiro Fujii
 # Copyright (c) 2009 Keiichiro Nagano
 # Copyright (c) 2009 Kimura Youichi
 # Copyright (c) 2006-2008 Ricardo Garcia Gonzalez
@@ -38,6 +39,7 @@ import os
 import re
 import socket
 import string
+import subprocess as sp
 import sys
 import time
 import urllib2
@@ -65,6 +67,11 @@ const_video_type_re = re.compile(r'^http://.*\.nicovideo\.jp/smile\?(.*?)=.*')
 
 const_comment_getthreadkey_url_str = 'http://flapi.nicovideo.jp/api/getthreadkey?thread=%s'
 const_comment_request_str = '<thread thread="%s" version="20061206" res_from="-1000" user_id="%s"%s/>'
+
+const_video_real_url_re = re.compile(r'^rtmpe://([^/]+)/([^?]+)\?.*?m=([^&]+)')
+const_rtmpe_playpath_re = re.compile(r'^([^:]+):')
+const_swf_url = 'http://res.nimg.jp/swf/player/secure_nccreator.swf?t=201111091500'
+const_flash_ver = 'WIN 11,6,602,180'
 
 # Print error message, followed by standard advice information, and then exit
 def error_advice_exit(error_text):
@@ -308,6 +315,86 @@ def download_comment(cmdl_opts, video_url, video_filename, video_url_id, video_i
 
 	cond_print('comment saved to %s\n' % outfile)
 
+class rtmpe_req:
+
+    def __init__(self, host, tc_url, page_url, playpath, fmst1, fmst2):
+        self.host = host
+        self.tc_url = tc_url
+        self.page_url = page_url
+        self.playpath = playpath
+        self.fmst1 = fmst1
+        self.fmst2 = fmst2
+        self.swf_url = const_swf_url
+        self.flash_ver = const_flash_ver
+
+    def build_command(self, output, resume=False, quiet=False):
+        command = ['rtmpdump']
+        if resume: command.append('-e')
+        if quiet: command.append('-q')
+        command += ['-l', '2',
+                    '-a', 'smile',
+                    '-n', self.host,
+                    '-t', self.tc_url,
+                    '-p', self.page_url,
+                    '-w', self.swf_url,
+                    '-f', '"' + self.flash_ver + '"', 
+                    '-y', self.playpath,
+                    '-C', 'S:' + self.fmst1,
+                    '-C', 'S:' + self.fmst2,
+                    '-C', 'S:' + self.playpath,
+                    '-o', output]
+        return command
+
+    def download(self, output, quiet=False):
+        command = self.build_command(output, quiet=quiet)
+        child = sp.Popen(command)
+        streamdata = child.communicate()[0]
+        rc = child.returncode
+
+        while rc == 2:
+            time.sleep(3)
+            command = self.build_command(output, resume=True, quiet=quiet)
+            child = sp.Popen(command)
+            streamdata = child.communicate()[0]
+            rc = child.returncode
+        
+        return rc == 0
+
+    def get_extension(self):
+        playpath_mo = const_rtmpe_playpath_re.match(self.playpath)
+        if playpath_mo is None:
+            sys.exit('Error: Invalid playpath')
+        video_extension = "." + playpath_mo.group(1)
+        return video_extension
+# end class rtmpe
+
+def build_rtmpe_req(flapi_params):
+    if not flapi_params.has_key('url') or \
+       not flapi_params.has_key('thread_id') or \
+       not flapi_params.has_key('fmst') is None:
+		return None
+
+    video_url = flapi_params['url'][0]
+    video_url_mo = const_video_real_url_re.match(video_url)
+    if video_url_mo is None:
+        return None
+    host = video_url_mo.group(1)
+    app = video_url_mo.group(2)
+    playpath = video_url_mo.group(3)
+
+    fmst = flapi_params['fmst'][0]
+
+    fmsts = fmst.split(':', 1)
+    if len(fmsts) < 2:
+        sys.exit('Error: invalid fmst: ' + flapi_params['fmst'][0])
+    fmst2, fmst1 = fmsts
+
+    tc_url = 'rtmpe://' + host + '/' + app
+    thread_id = flapi_params['thread_id'][0]
+    page_url = 'http://www.nicovideo.jp/watch/' + thread_id
+
+    return rtmpe_req(host, tc_url, page_url, playpath, fmst1, fmst2)
+
 # Create the command line options parser and parse command line
 cmdl_usage = 'usage: %prog [options] video_url'
 cmdl_version = const_version
@@ -434,6 +521,9 @@ for video_url_cmdl in cmdl_args:
 	video_info_data, response = download_step(True, 'Retrieving info data', 'unable to retrieve video webpage', video_url_info)
 	cond_print('Extracting URL "url" parameter... ')
 	video_url_url_param = cgi.parse_qs(video_info_data)
+
+	rtmpe_req = build_rtmpe_req(video_url_url_param)
+
 	if (video_url_url_param.has_key("url")):
 		video_url_url_param=video_url_url_param["url"][0]
 	else:
@@ -442,13 +532,16 @@ for video_url_cmdl in cmdl_args:
 	video_url_real = (video_url_url_param)
 	
 	# Extract video type and modify video_extension
-	video_type_mo = const_video_type_re.match(video_url_real)
-	if (video_type_mo):
-		if video_type_mo.group(1) == "s":
-			video_extension = ".swf"
-		elif video_type_mo.group(1) == "m":
-			video_extension = ".mp4"
-	
+	if rtmpe_req is None:
+		video_type_mo = const_video_type_re.match(video_url_real)
+		if (video_type_mo):
+			if video_type_mo.group(1) == "s":
+				video_extension = ".swf"
+			elif video_type_mo.group(1) == "m":
+				video_extension = ".mp4"
+	else:
+		video_extension = rtmpe_req.get_extension()
+
 	# Get output file name 
 	if cmdl_opts.outfile is None:
 		video_filename = '%s%s' % (video_url_id, video_extension)
@@ -473,63 +566,71 @@ for video_url_cmdl in cmdl_args:
 	
 	# Retrieve video data
 	try:
-		cond_print('Requesting video file... ')
-		video_data = perform_request(video_url_real)
-		cond_print('done.\n')
-		cond_print('Video data found at %s\n' % video_data.geturl())
+		if rtmpe_req is None:
+			cond_print('Requesting video file... ')
+			video_data = perform_request(video_url_real)
+			cond_print('done.\n')
+			cond_print('Video data found at %s\n' % video_data.geturl())
+			
+			if cmdl_opts.get_title:
+				print video_title
 		
-		if cmdl_opts.get_title:
-			print video_title
+			if cmdl_opts.get_url:
+				print video_data.geturl()
+			
+			if cmdl_opts.simulate or cmdl_opts.get_url:
+				continue
 		
-		if cmdl_opts.get_url:
-			print video_data.geturl()
+			try:
+				video_file = open(video_filename, 'wb')
+			except (IOError, OSError):
+				sys.exit('Error: unable to open "%s" for writing.' % video_filename)
+			try:
+				video_len = long(video_data.info()['Content-length'])
+				video_len_str = format_bytes(video_len)
+			except KeyError:
+				video_len = None
+				video_len_str = 'N/A'
 		
-		if cmdl_opts.simulate or cmdl_opts.get_url:
-			continue
-		
-		try:
-			video_file = open(video_filename, 'wb')
-		except (IOError, OSError):
-			sys.exit('Error: unable to open "%s" for writing.' % video_filename)
-		try:
-			video_len = long(video_data.info()['Content-length'])
-			video_len_str = format_bytes(video_len)
-		except KeyError:
-			video_len = None
-			video_len_str = 'N/A'
-		
-		byte_counter = 0
-		block_size = const_initial_block_size
-		start_time = time.time()
-		while True:
-			if video_len is not None:
-				percent = float(byte_counter) / float(video_len) * 100.0
-				percent_str = '%.1f' % percent
-				eta_str = calc_eta(start_time, time.time(), video_len, byte_counter)
-			else:
-				percent_str = '---.-'
-				eta_str = '--:--'
-			counter = format_bytes(byte_counter)
-			speed_str = calc_speed(start_time, time.time(), byte_counter)
-			cond_print('\rRetrieving video data: %5s%% (%8s of %s) at %8s/s ETA %s ' % (percent_str, counter, video_len_str, speed_str, eta_str))
+			byte_counter = 0
+			block_size = const_initial_block_size
+			start_time = time.time()
+			while True:
+				if video_len is not None:
+					percent = float(byte_counter) / float(video_len) * 100.0
+					percent_str = '%.1f' % percent
+					eta_str = calc_eta(start_time, time.time(), video_len, byte_counter)
+				else:
+					percent_str = '---.-'
+					eta_str = '--:--'
+				counter = format_bytes(byte_counter)
+				speed_str = calc_speed(start_time, time.time(), byte_counter)
+				cond_print('\rRetrieving video data: %5s%% (%8s of %s) at %8s/s ETA %s ' % (percent_str, counter, video_len_str, speed_str, eta_str))
 	
-			before = time.time()
-			video_block = video_data.read(block_size)
-			after = time.time()
-			dl_bytes = len(video_block)
-			if dl_bytes == 0:
-				break
-			byte_counter += dl_bytes
-			video_file.write(video_block)
-			block_size = new_block_size(before, after, dl_bytes)
+				before = time.time()
+				video_block = video_data.read(block_size)
+				after = time.time()
+				dl_bytes = len(video_block)
+				if dl_bytes == 0:
+					break
+				byte_counter += dl_bytes
+				video_file.write(video_block)
+				block_size = new_block_size(before, after, dl_bytes)
+			
+			if video_len is not None and byte_counter != video_len:
+				error_advice_exit('server did not send the expected amount of data')
 		
-		if video_len is not None and byte_counter != video_len:
-			error_advice_exit('server did not send the expected amount of data')
-		
-		video_file.close()
-		cond_print('done.\n')
-		cond_print('Video data saved to %s\n' % video_filename)
-	
+			video_file.close()
+			cond_print('done.\n')
+			cond_print('Video data saved to %s\n' % video_filename)
+
+		else: # rtmpe support
+			quiet = cmdl_opts.quiet or cmdl_opts.get_url
+			cond_print('Requesting video file... ')
+			rtmpe_req.download(video_filename, quiet=quiet)
+			cond_print('done.\n')
+			cond_print('Video data saved to %s\n' % video_filename)
+
 	except (urllib2.URLError, ValueError, httplib.HTTPException, TypeError, socket.error):
 		cond_print('failed.\n')
 		error_advice_exit('unable to download video data')
